@@ -104,93 +104,96 @@ class QueueProcessor(
 
             val settings = settingsRepository.settings.firstOrNull() ?: return
 
-        if (!settings.autoReplyEnabled) {
-            repository.markSkipped(id, "Auto-reply disabled")
-            ActivityLogStore.add("SKIPPED", "Message skipped for ${message.conversationDisplayName}: auto-reply disabled")
-            return
-        }
-
-        // Global pause via /.all — do not process any messages
-        if (settings.globalPauseEnabled) {
-            repository.markSkipped(id, "Global pause active")
-            ActivityLogStore.add("SKIPPED", "Message skipped for ${message.conversationDisplayName}: global pause active")
-            return
-        }
-
-        // Individual conversation pause via /.this — do not process messages for this conversation
-        // Unless it's an explicit exception during global pause
-        if (chatControl.isPaused(message.conversationKey) && !chatControl.isException(message.conversationKey)) {
-            repository.markSkipped(id, "Conversation paused")
-            ActivityLogStore.add("SKIPPED", "Message skipped for ${message.conversationDisplayName}: conversation paused")
-            return
-        }
-
-        // Check if message has been superseded by owner reply
-        if (message.superseded || supersededTracker.isSuperseded(message.messageId)) {
-            repository.markSuperseded(id, "Superseded by owner reply before processing")
-            ActivityLogStore.add("SKIPPED", "Message skipped for ${message.conversationDisplayName}: superseded by owner reply")
-            return
-        }
-
-        val ignored = settings.ignoredSendersCsv
-            .split(",")
-            .map { it.trim().lowercase() }
-            .filter { it.isNotBlank() }
-        if (ignored.any { message.actualSender.lowercase().contains(it) }) {
-            repository.markSkipped(id, "Ignored sender: ${message.actualSender}")
-            ActivityLogStore.add("SKIPPED", "Ignored sender: ${message.actualSender} in ${message.conversationDisplayName}")
-            return
-        }
-
-        repository.updateStatus(
-            id = id,
-            status = "PROCESSING",
-            retryCount = message.retryCount
-        )
-        ActivityLogStore.add("PROCESSING", "Generating AI reply for ${message.actualSender} in ${message.conversationDisplayName}")
-
-        // Retrieve previous 3 messages from conversation history for AI context
-        val contextMessages = historyRepository.getPreviousMessages(
-            conversationKey = message.conversationKey,
-            limit = 3,
-            beforeTimestampMs = message.originalTimestampMs
-        )
-        val recentHistory = contextMessages.map { entry ->
-            val prefix = when (entry.direction) {
-                MessageDirection.OUTGOING -> "ME: "
-                MessageDirection.INCOMING -> "THEM: "
-                MessageDirection.UNCERTAIN -> "UNKNOWN: "
+            if (!settings.autoReplyEnabled) {
+                repository.markSkipped(id, "Auto-reply disabled")
+                ActivityLogStore.add("SKIPPED", "Message skipped for ${message.conversationDisplayName}: auto-reply disabled")
+                return
             }
-            "$prefix${entry.messageText}"
-        }
 
-        val replyResult = try {
-            val reply = replyGenerator.generateReply(
-                settings = settings,
-                sender = message.actualSender,
-                incomingMessage = message.incomingMessageText,
-                recentHistory = recentHistory
+            // Global pause via /.all — do not process any messages
+            if (settings.globalPauseEnabled) {
+                repository.markSkipped(id, "Global pause active")
+                ActivityLogStore.add("SKIPPED", "Message skipped for ${message.conversationDisplayName}: global pause active")
+                return
+            }
+
+            // Individual conversation pause via /.this — do not process messages for this conversation
+            // Unless it's an explicit exception during global pause
+            if (chatControl.isPaused(message.conversationKey) && !chatControl.isException(message.conversationKey)) {
+                repository.markSkipped(id, "Conversation paused")
+                ActivityLogStore.add("SKIPPED", "Message skipped for ${message.conversationDisplayName}: conversation paused")
+                return
+            }
+
+            // Check if message has been superseded by owner reply
+            if (message.superseded || supersededTracker.isSuperseded(message.messageId)) {
+                repository.markSuperseded(id, "Superseded by owner reply before processing")
+                ActivityLogStore.add("SKIPPED", "Message skipped for ${message.conversationDisplayName}: superseded by owner reply")
+                return
+            }
+
+            val ignored = settings.ignoredSendersCsv
+                .split(",")
+                .map { it.trim().lowercase() }
+                .filter { it.isNotBlank() }
+            if (ignored.any { message.actualSender.lowercase().contains(it) }) {
+                repository.markSkipped(id, "Ignored sender: ${message.actualSender}")
+                ActivityLogStore.add("SKIPPED", "Ignored sender: ${message.actualSender} in ${message.conversationDisplayName}")
+                return
+            }
+
+            repository.updateStatus(
+                id = id,
+                status = "PROCESSING",
+                retryCount = message.retryCount
             )
-            null to reply
-        } catch (e: Exception) {
-            e to null
-        }
+            ActivityLogStore.add("PROCESSING", "Generating AI reply for ${message.actualSender} in ${message.conversationDisplayName}")
 
-        if (replyResult.second != null) {
-            val replyText = replyResult.second!!
-            deliverReply(message, replyText)
-        } else {
-            val error = replyResult.first ?: Exception("Unknown reply error")
-            handleGenerationError(message, error)
+            // Retrieve previous 3 messages from conversation history for AI context
+            val contextMessages = historyRepository.getPreviousMessages(
+                conversationKey = message.conversationKey,
+                limit = 3,
+                beforeTimestampMs = message.originalTimestampMs
+            )
+            val recentHistory = contextMessages.map { entry ->
+                val prefix = when (entry.direction) {
+                    MessageDirection.OUTGOING -> "ME: "
+                    MessageDirection.INCOMING -> "THEM: "
+                    MessageDirection.UNCERTAIN -> "UNKNOWN: "
+                }
+                "$prefix${entry.messageText}"
+            }
+
+            val replyResult = try {
+                val reply = replyGenerator.generateReply(
+                    settings = settings,
+                    sender = message.actualSender,
+                    incomingMessage = message.incomingMessageText,
+                    recentHistory = recentHistory
+                )
+                null to reply
+            } catch (e: Exception) {
+                e to null
+            }
+
+            if (replyResult.second != null) {
+                val replyText = replyResult.second!!
+                deliverReply(message, replyText)
+            } else {
+                val error = replyResult.first ?: Exception("Unknown reply error")
+                handleGenerationError(message, error)
+            }
+        } catch (e: Throwable) {
+            ActivityLogStore.add("ERROR", "processSingleMessage crashed for ${message.id}: ${e.message ?: e.javaClass.simpleName}")
+            repository.updateStatus(
+                id = id,
+                status = "RETRY_WAIT",
+                retryCount = message.retryCount + 1,
+                nextRetryTimeMs = System.currentTimeMillis() + 30_000,
+                lastError = "Processor crash: ${e.message ?: e.javaClass.simpleName}"
+            )
         }
-    } catch (e: Throwable) {
-        ActivityLogStore.add("ERROR", "processSingleMessage crashed for ${message.id}: ${e.message ?: e.javaClass.simpleName}")
-        repository.updateStatus(
-            id = id,
-            status = "RETRY_WAIT",
-            retryCount = message.retryCount + 1,
-            nextRetryTimeMs = System.currentTimeMillis() + 30_000,
-            lastError = "Processor crash: ${e.message ?: e.javaClass.simpleName}"
+    }
         )
     }
 }
