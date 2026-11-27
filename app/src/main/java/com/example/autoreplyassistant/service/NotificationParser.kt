@@ -1,0 +1,251 @@
+package com.example.autoreplyassistant.service
+
+import android.app.Notification
+import android.os.Bundle
+import android.service.notification.StatusBarNotification
+import com.example.autoreplyassistant.data.ConversationIdentity
+import com.example.autoreplyassistant.data.MessageDirection
+
+object NotificationParser {
+
+    private const val WHATSAPP = "com.whatsapp"
+    private const val WHATSAPP_BUSINESS = "com.whatsapp.w4b"
+
+    val supportedPackages: Set<String> = setOf(WHATSAPP, WHATSAPP_BUSINESS)
+
+    fun parse(
+        sbn: StatusBarNotification,
+        ownerName: String
+    ): ParsedNotification? {
+        val packageName = sbn.packageName
+        if (packageName !in supportedPackages) return null
+
+        val notification = sbn.notification ?: return null
+
+        val flags = notification.flags
+        if ((flags and Notification.FLAG_GROUP_SUMMARY) != 0) return null
+        if ((flags and Notification.FLAG_ONGOING_EVENT) != 0) return null
+
+        val extras = notification.extras ?: return null
+        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
+        val body = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty()
+        val infoText = extras.getCharSequence(Notification.EXTRA_INFO_TEXT)?.toString()?.trim()
+        val postTimeMs = sbn.postTime
+
+        if (title.isBlank() && body.isBlank()) return null
+
+        val quotedText = extractQuotedText(extras)
+        val quotedSender = extractQuotedSender(extras)
+
+        val messagingStyle = notification.getMessagingStyle() ?: return parseFallback(
+            packageName = packageName,
+            title = title,
+            body = body,
+            postTimeMs = postTimeMs,
+            quotedText = quotedText,
+            quotedSender = quotedSender
+        )
+
+        val messages = messagingStyle.messages
+        if (messages.isEmpty()) return parseFallback(
+            packageName = packageName,
+            title = title,
+            body = body,
+            postTimeMs = postTimeMs,
+            quotedText = quotedText,
+            quotedSender = quotedSender
+        )
+
+        val conversationTitle = messagingStyle.conversationTitle?.let { it.trim() }.takeIf { it.isNotEmpty() }
+            ?: title.takeIf { it.isNotEmpty() }
+            ?: "WhatsApp conversation"
+
+        val distinctSenders = messages
+            .map { it.sender?.name?.trim() }
+            .filter { it.isNotBlank() }
+            .toSet()
+        val isGroup = distinctSenders.size > 1 || (messagingStyle.conversationTitle != null)
+
+        val conversationKey = buildConversationKey(
+            packageName = packageName,
+            conversationTitle = conversationTitle,
+            infoText = infoText,
+            isGroup = isGroup
+        )
+
+        val identity = ConversationIdentity(
+            packageName = packageName,
+            conversationKey = conversationKey,
+            displayName = conversationTitle,
+            isGroup = isGroup
+        )
+
+        val latestMessage = messages.lastOrNull() ?: return null
+        val latestSender = latestMessage.sender?.name?.trim().orEmpty()
+        val latestText = latestMessage.text?.trim().orEmpty()
+        val latestTimestamp = latestMessage.timestamp?.let { it.toLong() } ?: postTimeMs
+
+        if (latestText.isBlank()) return null
+
+        val direction = determineDirection(
+            latestSender = latestSender,
+            ownerName = ownerName,
+            isGroup = isGroup,
+            distinctSenders = distinctSenders
+        )
+
+        val messageId = buildMessageId(
+            packageName = packageName,
+            sender = latestSender,
+            text = latestText,
+            timestampMs = latestTimestamp
+        )
+
+        return ParsedNotification(
+            identity = identity,
+            direction = direction,
+            actualSender = latestSender.takeIf { it.isNotBlank() } ?: "Unknown",
+            messageText = latestText,
+            messageId = messageId,
+            originalTimestampMs = latestTimestamp,
+            notificationPostTimeMs = postTimeMs,
+            quotedMessageText = quotedText,
+            quotedMessageSender = quotedSender
+        )
+    }
+
+    private fun parseFallback(
+        packageName: String,
+        title: String,
+        body: String,
+        postTimeMs: Long,
+        quotedText: String? = null,
+        quotedSender: String? = null
+    ): ParsedNotification {
+        val conversationKey = buildConversationKey(
+            packageName = packageName,
+            conversationTitle = title,
+            infoText = null,
+            isGroup = false
+        )
+        val messageId = buildMessageId(
+            packageName = packageName,
+            sender = title,
+            text = body,
+            timestampMs = postTimeMs
+        )
+        return ParsedNotification(
+            identity = ConversationIdentity(
+                packageName = packageName,
+                conversationKey = conversationKey,
+                displayName = title.takeIf { it.isNotEmpty() } ?: "WhatsApp conversation",
+                isGroup = false
+            ),
+            direction = MessageDirection.UNCERTAIN,
+            actualSender = title.takeIf { it.isNotEmpty() } ?: "Unknown",
+            messageText = body,
+            messageId = messageId,
+            originalTimestampMs = postTimeMs,
+            notificationPostTimeMs = postTimeMs,
+            quotedMessageText = quotedText,
+            quotedMessageSender = quotedSender
+        )
+    }
+
+    /**
+     * Attempt to extract quoted message text from notification extras.
+     * WhatsApp may include quoted content in various extra fields when
+     * a user replies to a specific message.
+     */
+    private fun extractQuotedText(extras: Bundle): String? {
+        val keys = arrayOf(
+            "android.text",
+            "android.subText",
+            "com.whatsapp.quoted_text",
+            "quoted_text",
+            "reply_text"
+        )
+        for (key in keys) {
+            val value = extras.getCharSequence(key)?.toString()?.trim()
+            if (value.isNotBlank()) return value
+        }
+        val textLines = extras.getCharSequenceArray("android.textLines")
+        if (textLines != null && textLines.size >= 2) {
+            val first = textLines.first().toString().trim()
+            val last = textLines.last().toString().trim()
+            if (first != last && first.isNotBlank()) return first
+        }
+        return null
+    }
+
+    /**
+     * Attempt to extract quoted message sender from notification extras.
+     */
+    private fun extractQuotedSender(extras: Bundle): String? {
+        val keys = arrayOf(
+            "android.title",
+            "com.whatsapp.quoted_sender",
+            "quoted_sender"
+        )
+        for (key in keys) {
+            val value = extras.getCharSequence(key)?.toString()?.trim()
+            if (value.isNotBlank()) return value
+        }
+        return null
+    }
+
+    private fun buildConversationKey(
+        packageName: String,
+        conversationTitle: String?,
+        infoText: String?,
+        isGroup: Boolean
+    ): String {
+        val stableId = if (isGroup && infoText.isNotBlank()) infoText else conversationTitle
+        return "$packageName|${stableId.takeIf { it.isNotEmpty() } ?: "unknown"}"
+    }
+
+    private fun buildMessageId(
+        packageName: String,
+        sender: String,
+        text: String,
+        timestampMs: Long
+    ): String {
+        val textHash = text.hashCode().toString()
+        return "$packageName|$sender|$textHash|$timestampMs"
+    }
+
+    internal fun determineDirection(
+        latestSender: String,
+        ownerName: String,
+        isGroup: Boolean,
+        distinctSenders: Set<String>
+    ): MessageDirection {
+        if (ownerName.isBlank()) {
+            return MessageDirection.UNCERTAIN
+        }
+
+        val normalizedOwner = ownerName.trim().lowercase()
+        val normalizedSender = latestSender.trim().lowercase()
+
+        if (normalizedSender == normalizedOwner) {
+            return MessageDirection.OUTGOING
+        }
+
+        return MessageDirection.INCOMING
+    }
+}
+
+/**
+ * Result of parsing a WhatsApp notification.
+ */
+data class ParsedNotification(
+    val identity: ConversationIdentity,
+    val direction: MessageDirection,
+    val actualSender: String,
+    val messageText: String,
+    val messageId: String,
+    val originalTimestampMs: Long,
+    val notificationPostTimeMs: Long,
+    val quotedMessageText: String? = null,
+    val quotedMessageSender: String? = null
+)

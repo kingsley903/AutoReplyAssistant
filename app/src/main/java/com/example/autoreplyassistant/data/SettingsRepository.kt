@@ -19,7 +19,9 @@ data class AppSettings(
     val modelName: String = "google/gemini-2.5-flash",
     val systemPrompt: String = "You are a helpful assistant. Write concise, natural replies. Do not claim to be the account owner. If a message needs personal knowledge, ask a brief clarification instead of inventing facts.",
     val replyDelayMs: Long = 2500L,
-    val ignoredSendersCsv: String = ""
+    val ignoredSendersCsv: String = "",
+    val ownerName: String = "",
+    val globalPauseEnabled: Boolean = false
 )
 
 class SettingsRepository(context: Context) {
@@ -34,6 +36,9 @@ class SettingsRepository(context: Context) {
         val systemPrompt = stringPreferencesKey("system_prompt")
         val replyDelayMs = longPreferencesKey("reply_delay_ms")
         val ignoredSendersCsv = stringPreferencesKey("ignored_senders_csv")
+        val ownerName = stringPreferencesKey("owner_name")
+        // New key for global pause of auto-reply via chat commands
+        val globalPauseEnabled = booleanPreferencesKey("global_pause_enabled")
     }
 
     val settings: Flow<AppSettings> = dataStore.data.map { p ->
@@ -45,7 +50,9 @@ class SettingsRepository(context: Context) {
             modelName = p[Keys.modelName] ?: AppSettings().modelName,
             systemPrompt = p[Keys.systemPrompt] ?: AppSettings().systemPrompt,
             replyDelayMs = p[Keys.replyDelayMs] ?: 2500L,
-            ignoredSendersCsv = p[Keys.ignoredSendersCsv] ?: ""
+            ignoredSendersCsv = p[Keys.ignoredSendersCsv] ?: "",
+            ownerName = p[Keys.ownerName] ?: "",
+            globalPauseEnabled = p[Keys.globalPauseEnabled] ?: false
         )
     }
 
@@ -59,7 +66,14 @@ class SettingsRepository(context: Context) {
             p[Keys.systemPrompt] = settings.systemPrompt
             p[Keys.replyDelayMs] = settings.replyDelayMs.coerceIn(0L, 60_000L)
             p[Keys.ignoredSendersCsv] = settings.ignoredSendersCsv
+            p[Keys.ownerName] = settings.ownerName.trim()
+            p[Keys.globalPauseEnabled] = settings.globalPauseEnabled
         }
+    }
+
+    /** Update the global pause flag used by chat commands */
+    suspend fun updateGlobalPause(enabled: Boolean) {
+        dataStore.edit { it[Keys.globalPauseEnabled] = enabled }
     }
 
     suspend fun updateAutoReply(enabled: Boolean) {

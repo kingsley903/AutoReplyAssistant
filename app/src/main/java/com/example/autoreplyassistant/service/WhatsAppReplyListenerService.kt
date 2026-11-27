@@ -1,115 +1,323 @@
 package com.example.autoreplyassistant.service
 
-import android.app.Notification
-import android.app.Notification.Action
-import android.app.RemoteInput
-import android.content.Intent
-import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import android.util.LruCache
 import com.example.autoreplyassistant.data.ActivityLogStore
+import com.example.autoreplyassistant.data.ChatControlRepository
+import com.example.autoreplyassistant.data.ConversationHistoryEntry
+import com.example.autoreplyassistant.data.ConversationHistoryRepository
+import com.example.autoreplyassistant.data.MessageDirection
+import com.example.autoreplyassistant.data.MessageQueueDatabase
+import com.example.autoreplyassistant.data.MessageQueueRepository
+import com.example.autoreplyassistant.data.QueuedMessage
 import com.example.autoreplyassistant.data.SettingsRepository
-import com.example.autoreplyassistant.network.ReplyGenerator
+import com.example.autoreplyassistant.data.SupersededMessageTracker
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
 
 class WhatsAppReplyListenerService : NotificationListenerService() {
-    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
-    private lateinit var settingsRepository: SettingsRepository
-    private val replyGenerator = ReplyGenerator()
 
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private lateinit var queueProcessor: QueueProcessor
+    private lateinit var chatControl: ChatControlRepository
+    private lateinit var historyRepository: ConversationHistoryRepository
+    private lateinit var supersededTracker: SupersededMessageTracker
+    private lateinit var messageRepository: MessageQueueRepository
+
+    private val history = object : LruCache<String, MutableList<String>>(100) {}
     private val recentlyHandled = ConcurrentHashMap.newKeySet<String>()
     private val senderLastReplyAt = ConcurrentHashMap<String, Long>()
-    private val history = object : android.util.LruCache<String, MutableList<String>>(100) {}
+
+    // WhatsApp command prefixes — matched case-insensitively, entire message must match
+    private val COMMANDS = setOf(
+        "/.this", "/.all", "/.resume", "/.resumeall",
+        "/.old", "/.r.this", "/.r.all"
+    )
 
     override fun onCreate() {
         super.onCreate()
-        settingsRepository = SettingsRepository(applicationContext)
+        val dbHelper = MessageQueueDatabase(applicationContext)
+        queueProcessor = QueueProcessor(applicationContext, dbHelper)
+        queueProcessor.start()
+        chatControl = ChatControlRepository(dbHelper)
+        historyRepository = ConversationHistoryRepository(dbHelper)
+        messageRepository = MessageQueueRepository(dbHelper)
+        supersededTracker = SupersededMessageTracker(messageRepository)
+        ActivityLogStore.add("SERVICE", "WhatsApp reply listener service started")
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
-        if (sbn.packageName !in ALLOWED_PACKAGES) return
-        val notification = sbn.notification ?: return
-        if ((notification.flags and Notification.FLAG_GROUP_SUMMARY) != 0) return
-        if ((notification.flags and Notification.FLAG_ONGOING_EVENT) != 0) return
-
-        val extras = notification.extras ?: return
-        val sender = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
-        val body = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty()
-        if (sender.isBlank() || body.isBlank()) return
-
-        val action = notification.actions
-            ?.firstOrNull { candidate -> candidate.remoteInputs?.isNotEmpty() == true }
-            ?: return
-        val remoteInputs = action.remoteInputs ?: return
-        val messageKey = "${sbn.packageName}|${sender.lowercase()}|${body.hashCode()}|${sbn.postTime}"
-        if (!recentlyHandled.add(messageKey)) return
-        trimHandledKeys()
+        if (sbn.packageName !in NotificationParser.supportedPackages) return
 
         serviceScope.launch {
             try {
-                val settings = settingsRepository.settings.first()
-                if (!settings.autoReplyEnabled) return@launch
+                val ownerName = getOwnerName()
+                val parsed = NotificationParser.parse(sbn, ownerName) ?: return@launch
 
-                val ignored = settings.ignoredSendersCsv
-                    .split(",")
-                    .map { it.trim().lowercase() }
-                    .filter { it.isNotBlank() }
-                if (ignored.any { sender.lowercase().contains(it) }) {
-                    ActivityLogStore.add("SKIPPED", "Ignored sender: $sender")
+                ActivityLogStore.add(
+                    "CONVERSATION",
+                    "${parsed.identity.toLogString()} | sender: ${parsed.actualSender} | direction: ${parsed.direction}"
+                )
+
+                // Store every observed message in persistent conversation history
+                val isCmd = parsed.direction == MessageDirection.OUTGOING && ownerName.isNotBlank() &&
+                    COMMANDS.contains(parsed.messageText.trim().lowercase())
+                historyRepository.add(
+                    ConversationHistoryEntry(
+                        conversationKey = parsed.identity.conversationKey,
+                        packageName = parsed.identity.packageName,
+                        sender = parsed.actualSender,
+                        messageText = parsed.messageText,
+                        direction = parsed.direction,
+                        timestampMs = parsed.originalTimestampMs,
+                        isCommand = isCmd
+                    )
+                )
+
+                // === COMMAND DETECTION ===
+                // Commands only execute when message is OUTGOING and authored by the account owner.
+                // If direction is UNCERTAIN, never execute a command.
+                if (parsed.direction == MessageDirection.OUTGOING && ownerName.isNotBlank()) {
+                    val trimmedText = parsed.messageText.trim()
+                    val lowerText = trimmedText.lowercase()
+                    if (COMMANDS.contains(lowerText)) {
+                        handleCommand(parsed, lowerText)
+                        return@launch
+                    }
+                }
+
+                // For OUTGOING messages from owner, check if they supersede pending incoming messages
+                if (parsed.direction == MessageDirection.OUTGOING && ownerName.isNotBlank()) {
+                    supersededTracker.markConversationSuperseded(parsed.identity.conversationKey)
+                    ActivityLogStore.add(
+                        "SKIPPED",
+                        "Outgoing message from ${parsed.actualSender} in ${parsed.identity.displayName} — not replying, checked for supersede"
+                    )
                     return@launch
+                }
+
+                when (parsed.direction) {
+                    MessageDirection.UNCERTAIN -> {
+                        ActivityLogStore.add(
+                            "SKIPPED",
+                            "Direction uncertain for message in ${parsed.identity.displayName} — not replying"
+                        )
+                        return@launch
+                    }
+                    MessageDirection.INCOMING -> {
+                        // Proceed to queue
+                    }
+                }
+
+                if (NotificationParser.supportedPackages.contains(sbn.packageName)) {
+                    if (recentlyHandled.contains(parsed.messageId)) {
+                        ActivityLogStore.add(
+                            "SKIPPED",
+                            "Duplicate message suppressed: ${parsed.actualSender} in ${parsed.identity.displayName}"
+                        )
+                        return@launch
+                    }
+                    recentlyHandled.add(parsed.messageId)
+                    trimHandledKeys()
                 }
 
                 val now = System.currentTimeMillis()
-                val last = senderLastReplyAt[sender.lowercase()] ?: 0L
+                val last = senderLastReplyAt[parsed.actualSender.lowercase()] ?: 0L
                 if (now - last < MIN_SENDER_COOLDOWN_MS) {
-                    ActivityLogStore.add("SKIPPED", "Cooldown active for $sender")
+                    ActivityLogStore.add(
+                        "SKIPPED",
+                        "Cooldown active for ${parsed.actualSender} in ${parsed.identity.displayName}"
+                    )
                     return@launch
                 }
 
-                val previous = synchronized(history) {
-                    history.get(sender.lowercase())?.toList().orEmpty()
-                }
-                val reply = replyGenerator.generateReply(settings, sender, body, previous)
-                if (reply.isBlank()) {
-                    ActivityLogStore.add("ERROR", "No reply generated for $sender")
+                val queued = QueuedMessage(
+                    messageId = parsed.messageId,
+                    packageName = parsed.identity.packageName,
+                    conversationKey = parsed.identity.conversationKey,
+                    conversationDisplayName = parsed.identity.displayName,
+                    actualSender = parsed.actualSender,
+                    incomingMessageText = parsed.messageText,
+                    originalTimestampMs = parsed.originalTimestampMs,
+                    status = "PENDING",
+                    quotedMessageRef = parsed.quotedMessageText
+                )
+
+                val insertedId = queueProcessor.enqueue(queued)
+                if (insertedId >= 0) {
+                    ActivityLogStore.add(
+                        "QUEUED",
+                        "Message from ${parsed.actualSender} queued for ${parsed.identity.displayName}"
+                    )
+                } else {
+                    ActivityLogStore.add(
+                        "SKIPPED",
+                        "Duplicate message already in queue: ${parsed.actualSender} in ${parsed.identity.displayName}"
+                    )
                     return@launch
                 }
 
-                delay(settings.replyDelayMs.coerceIn(0L, 60_000L))
-                val currentSettings = settingsRepository.settings.first()
-                if (!currentSettings.autoReplyEnabled) {
-                    ActivityLogStore.add("CANCELLED", "Auto-reply disabled before sending to $sender")
-                    return@launch
-                }
+                senderLastReplyAt[parsed.actualSender.lowercase()] = now
 
-                val fillInIntent = Intent()
-                val results = Bundle()
-                remoteInputs.forEach { input -> results.putCharSequence(input.resultKey, reply) }
-                RemoteInput.addResultsToIntent(remoteInputs, fillInIntent, results)
-                action.actionIntent.send(this@WhatsAppReplyListenerService, 0, fillInIntent)
+                queueProcessor.wakeUp()
 
-                senderLastReplyAt[sender.lowercase()] = System.currentTimeMillis()
-                synchronized(history) {
-                    val contactHistory = history.get(sender.lowercase()) ?: mutableListOf()
-                    contactHistory.add("THEM: $body")
-                    contactHistory.add("ME: $reply")
-                    while (contactHistory.size > 5) contactHistory.removeAt(0)
-                    history.put(sender.lowercase(), contactHistory)
-                }
-                ActivityLogStore.add("SENT", "Auto-replied to $sender")
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (error: Exception) {
-                ActivityLogStore.add("ERROR", "Reply to $sender failed: ${error.message ?: error.javaClass.simpleName}")
+                ActivityLogStore.add(
+                    "ERROR",
+                    "Notification processing failed for ${sbn.packageName}: ${error.message ?: error.javaClass.simpleName}"
+                )
             }
+        }
+    }
+
+    /**
+     * Handles chat control commands sent by the account owner.
+     * Command messages are never queued, never sent to OpenRouter, and never added to AI history.
+     */
+    private fun handleCommand(parsed: ParsedNotification, command: String) {
+        val conversationKey = parsed.identity.conversationKey
+        val displayName = parsed.identity.displayName
+        val packageName = parsed.identity.packageName
+
+        when (command) {
+            "/.this" -> {
+                // Pause current conversation only
+                chatControl.pause(conversationKey, displayName)
+                ActivityLogStore.add(
+                    "COMMAND",
+                    "Conversation paused via /.this: $displayName ($packageName)"
+                )
+            }
+            "/.all" -> {
+                // Pause all conversations globally
+                SettingsRepository(applicationContext).updateGlobalPause(true)
+                ActivityLogStore.add(
+                    "COMMAND",
+                    "Global auto-reply paused via /.all (all conversations)"
+                )
+            }
+            "/.resume" -> {
+                // Resume current conversation only (does not override global pause)
+                chatControl.resume(conversationKey)
+                ActivityLogStore.add(
+                    "COMMAND",
+                    "Conversation resumed via /.resume: $displayName ($packageName)"
+                )
+            }
+            "/.resumeall" -> {
+                // Resume global auto-replies (does not unpause individual conversations)
+                SettingsRepository(applicationContext).updateGlobalPause(false)
+                ActivityLogStore.add(
+                    "COMMAND",
+                    "Global auto-reply resumed via /.resumeall"
+                )
+            }
+            "/.old" -> {
+                // Manual old-message response: respond to quoted message
+                handleOldCommand(parsed)
+            }
+            "/.r.this" -> {
+                // Reactivate current conversation (exception to global pause)
+                chatControl.resume(conversationKey)
+                chatControl.addException(conversationKey, displayName)
+                SettingsRepository(applicationContext).updateGlobalPause(false)
+                // Note: global pause is turned off, but this conversation is explicitly allowed
+                // Other conversations remain paused via paused_conversations table
+                ActivityLogStore.add(
+                    "COMMAND",
+                    "Conversation reactivated via /.R.this: $displayName ($packageName) — added as global pause exception"
+                )
+            }
+            "/.r.all" -> {
+                // Reactivate all conversations
+                SettingsRepository(applicationContext).updateGlobalPause(false)
+                chatControl.clearAllExceptions()
+                chatControl.resumeAll()
+                ActivityLogStore.add(
+                    "COMMAND",
+                    "All conversations reactivated via /.R.all"
+                )
+            }
+        }
+    }
+
+    /**
+     * Handle /.old command — respond to a quoted/old message.
+     * Extracts quoted message from notification metadata and queues it for AI response.
+     */
+    private fun handleOldCommand(parsed: ParsedNotification) {
+        val quotedText = parsed.quotedMessageText
+        val quotedSender = parsed.quotedMessageSender
+
+        if (quotedText.isBlank()) {
+            ActivityLogStore.add(
+                "ERROR",
+                "/.old command: WhatsApp did not expose quoted message metadata. Cannot determine which message to respond to."
+            )
+            return
+        }
+
+        val targetSender = quotedSender.takeIf { it.isNotBlank() } ?: parsed.actualSender
+
+        // Never respond to owner-authored messages
+        val ownerName = getOwnerNameSync()
+        if (ownerName.isNotBlank() && targetSender.trim().lowercase() == ownerName.trim().lowercase()) {
+            ActivityLogStore.add(
+                "SKIPPED",
+                "/.old command: quoted message is from account owner ($targetSender) — not replying"
+            )
+            return
+        }
+
+        val queued = QueuedMessage(
+            messageId = "old_${parsed.messageId}_${System.currentTimeMillis()}",
+            packageName = parsed.identity.packageName,
+            conversationKey = parsed.identity.conversationKey,
+            conversationDisplayName = parsed.identity.displayName,
+            actualSender = targetSender,
+            incomingMessageText = quotedText,
+            originalTimestampMs = parsed.originalTimestampMs,
+            status = "PENDING",
+            quotedMessageRef = quotedText
+        )
+
+        val insertedId = queueProcessor.enqueueOldMessage(queued)
+        if (insertedId >= 0) {
+            ActivityLogStore.add(
+                "QUEUED",
+                "/.old: queued response to quoted message from $targetSender in ${parsed.identity.displayName}"
+            )
+        } else {
+            ActivityLogStore.add(
+                "SKIPPED",
+                "/.old: duplicate manual request suppressed"
+            )
+        }
+    }
+
+    private suspend fun getOwnerNameSync(): String {
+        return try {
+            val repo = SettingsRepository(applicationContext)
+            repo.settings.first().ownerName
+        } catch (e: Exception) {
+            ""
+        }
+    }
+
+    private suspend fun getOwnerName(): String {
+        return try {
+            val repo = SettingsRepository(applicationContext)
+            repo.settings.first().ownerName
+        } catch (e: Exception) {
+            ""
         }
     }
 
@@ -120,12 +328,11 @@ class WhatsAppReplyListenerService : NotificationListenerService() {
     }
 
     override fun onDestroy() {
-        serviceScope.cancel()
+        queueProcessor.shutdown()
         super.onDestroy()
     }
 
     companion object {
-        private val ALLOWED_PACKAGES = setOf("com.whatsapp", "com.whatsapp.w4b")
         private const val MIN_SENDER_COOLDOWN_MS = 5_000L
     }
 }

@@ -38,8 +38,12 @@ class ReplyGenerator(
         ))
 
         recentHistory.takeLast(5).forEach { line ->
-            val role = if (line.startsWith("ME: ")) "assistant" else "user"
-            val content = line.removePrefix("ME: ").removePrefix("THEM: ")
+            val (role, content) = when {
+                line.startsWith("ME: ") -> "assistant" to line.removePrefix("ME: ")
+                line.startsWith("THEM: ") -> "user" to line.removePrefix("THEM: ")
+                line.startsWith("UNKNOWN: ") -> "user" to line.removePrefix("UNKNOWN: ")
+                else -> "user" to line
+            }
             messages.put(JSONObject().put("role", role).put("content", content))
         }
 
@@ -66,7 +70,9 @@ class ReplyGenerator(
             val responseText = response.body?.string().orEmpty()
             if (!response.isSuccessful) {
                 val detail = responseText.take(400).ifBlank { response.message }
-                throw IOException("AI endpoint returned HTTP ${response.code}: $detail")
+                val retryAfter = response.header("Retry-After")
+                val retrySuffix = if (retryAfter != null) " Retry-After: $retryAfter" else ""
+                throw IOException("AI endpoint returned HTTP ${response.code}: $detail$retrySuffix")
             }
             val root = JSONObject(responseText)
             val content = root.optJSONArray("choices")

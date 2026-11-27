@@ -50,7 +50,12 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import com.example.autoreplyassistant.data.ActivityLogStore
 import com.example.autoreplyassistant.data.AppSettings
+import com.example.autoreplyassistant.data.ChatControlRepository
+import com.example.autoreplyassistant.data.MessageQueueDatabase
+import com.example.autoreplyassistant.data.MessageQueueRepository
+import com.example.autoreplyassistant.data.PausedConversation
 import com.example.autoreplyassistant.data.SettingsRepository
+import com.example.autoreplyassistant.data.SupersededMessageTracker
 import kotlinx.coroutines.launch
 
 class MainActivity : ComponentActivity() {
@@ -83,7 +88,19 @@ private fun Dashboard(repository: SettingsRepository) {
     var prompt by remember(settings.systemPrompt) { mutableStateOf(settings.systemPrompt) }
     var delayMs by remember(settings.replyDelayMs) { mutableStateOf(settings.replyDelayMs.toString()) }
     var ignored by remember(settings.ignoredSendersCsv) { mutableStateOf(settings.ignoredSendersCsv) }
+    var ownerName by remember(settings.ownerName) { mutableStateOf(settings.ownerName) }
     var message by remember { mutableStateOf("") }
+
+    // Chat control state
+    val dbHelper = MessageQueueDatabase(context)
+    val chatControl = remember { ChatControlRepository(dbHelper) }
+    val messageRepository = remember { MessageQueueRepository(dbHelper) }
+    val supersededTracker = remember { SupersededMessageTracker(messageRepository) }
+    var globalPaused by remember(settings.globalPauseEnabled) { mutableStateOf(settings.globalPauseEnabled) }
+    var pausedConversations by remember { mutableStateOf(chatControl.getAllPaused()) }
+    var exceptionConversations by remember { mutableStateOf(chatControl.getAllExceptions()) }
+    var pendingCount by remember { mutableStateOf(0) }
+    var supersededCount by remember { mutableStateOf(0) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
@@ -207,6 +224,11 @@ private fun Dashboard(repository: SettingsRepository) {
                 label = { Text("Ignored Contacts (comma-separated)") },
                 modifier = Modifier.fillMaxWidth(), minLines = 2
             )
+            OutlinedTextField(
+                ownerName, { ownerName = it },
+                label = { Text("Your WhatsApp Name (for outgoing detection)") },
+                modifier = Modifier.fillMaxWidth(), singleLine = true
+            )
 
             Button(
                 onClick = {
@@ -226,7 +248,8 @@ private fun Dashboard(repository: SettingsRepository) {
                                     modelName = model,
                                     systemPrompt = prompt,
                                     replyDelayMs = parsedDelay.coerceIn(0L, 60_000L),
-                                    ignoredSendersCsv = ignored
+                                    ignoredSendersCsv = ignored,
+                                    ownerName = ownerName
                                 )
                             )
                             message = "Settings saved."
@@ -266,6 +289,163 @@ private fun Dashboard(repository: SettingsRepository) {
                 }
             }
             Spacer(Modifier.height(20.dp))
+
+            Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
+                Column(Modifier.padding(14.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text("WhatsApp Control Commands", style = MaterialTheme.typography.titleLarge)
+                    Text("Send these messages from your WhatsApp account to control automatic replies.", style = MaterialTheme.typography.bodySmall)
+
+                    CommandRow(command = "/.this", description = "Silence automatic replies in this chat only.")
+                    CommandRow(command = "/.all", description = "Silence automatic replies in every chat.")
+                    CommandRow(command = "/.R.this", description = "Wake this chat (exception during global silence).")
+                    CommandRow(command = "/.R.all", description = "Wake all chats (clear global and individual silence).")
+                    CommandRow(command = "/.old", description = "Respond to a selected old message (reply to it first).")
+
+                    Spacer(Modifier.height(8.dp))
+
+                    Text("Current Status", style = MaterialTheme.typography.titleMedium)
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Global auto-reply:", style = MaterialTheme.typography.bodyMedium)
+                        Text(
+                            if (globalPaused) "PAUSED" else "ACTIVE",
+                            style = MaterialTheme.typography.bodyMedium.copy(
+                                color = if (globalPaused) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+                            )
+                        )
+                    }
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Individually paused conversations:", style = MaterialTheme.typography.bodyMedium)
+                        Text("${pausedConversations.size}", style = MaterialTheme.typography.bodyMedium)
+                    }
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Global pause exceptions:", style = MaterialTheme.typography.bodyMedium)
+                        Text("${exceptionConversations.size}", style = MaterialTheme.typography.bodyMedium)
+                    }
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Pending messages:", style = MaterialTheme.typography.bodyMedium)
+                        Text("${pendingCount}", style = MaterialTheme.typography.bodyMedium)
+                    }
+                    Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                        Text("Superseded (owner replied):", style = MaterialTheme.typography.bodyMedium)
+                        Text("${supersededCount}", style = MaterialTheme.typography.bodyMedium)
+                    }
+
+                    Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch {
+                                    SettingsRepository(context).updateGlobalPause(false)
+                                    globalPaused = false
+                                    message = "Global auto-reply resumed."
+                                }
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("Resume Global") }
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch {
+                                    SettingsRepository(context).updateGlobalPause(true)
+                                    globalPaused = true
+                                    message = "Global auto-reply paused."
+                                }
+                            },
+                            modifier = Modifier.weight(1f)
+                        ) { Text("Pause Global") }
+                    }
+
+                    if (pausedConversations.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text("Individually Paused Conversations", style = MaterialTheme.typography.titleMedium)
+                        LazyColumn(
+                            modifier = Modifier.fillMaxWidth().height(min(120.dp, 48.dp * pausedConversations.size)),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            items(pausedConversations) { conv ->
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Column {
+                                        Text(conv.displayName, style = MaterialTheme.typography.bodyMedium)
+                                        Text(
+                                            "${conv.packageName} • ${chatControl.formatPausedDuration(conv.pausedAt)}",
+                                            style = MaterialTheme.typography.bodySmall.copy(
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        )
+                                    }
+                                    OutlinedButton(
+                                        onClick = {
+                                            scope.launch {
+                                                chatControl.resume(conv.conversationKey)
+                                                pausedConversations = chatControl.getAllPaused()
+                                                message = "Resumed ${conv.displayName}."
+                                            }
+                                        }
+                                    ) { Text("Resume") }
+                                }
+                            }
+                        }
+                    }
+
+                    Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch {
+                                    val count = chatControl.resumeAll()
+                                    pausedConversations = chatControl.getAllPaused()
+                                    message = "Resumed $count individually paused conversation(s)."
+                                }
+                            }
+                        ) { Text("Resume All Individual Pauses") }
+                    }
+
+                    if (exceptionConversations.isNotEmpty()) {
+                        Spacer(Modifier.height(8.dp))
+                        Text("Global Pause Exceptions (allowed during global silence)", style = MaterialTheme.typography.titleMedium)
+                        LazyColumn(
+                            modifier = Modifier.fillMaxWidth().height(min(120.dp, 48.dp * exceptionConversations.size)),
+                            verticalArrangement = Arrangement.spacedBy(4.dp)
+                        ) {
+                            items(exceptionConversations) { conv ->
+                                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                                    Column {
+                                        Text(conv.displayName, style = MaterialTheme.typography.bodyMedium)
+                                        Text(
+                                            "${conv.packageName} • ${chatControl.formatPausedDuration(conv.pausedAt)}",
+                                            style = MaterialTheme.typography.bodySmall.copy(
+                                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                                            )
+                                        )
+                                    }
+                                    OutlinedButton(
+                                        onClick = {
+                                            scope.launch {
+                                                chatControl.removeException(conv.conversationKey)
+                                                exceptionConversations = chatControl.getAllExceptions()
+                                                message = "Removed exception for ${conv.displayName}."
+                                            }
+                                        }
+                                    ) { Text("Remove") }
+                                }
+                            }
+                        }
+                    }
+
+                    Row(horizontalArrangement = Arrangement.SpaceBetween, modifier = Modifier.fillMaxWidth()) {
+                        OutlinedButton(
+                            onClick = {
+                                scope.launch {
+                                    pendingCount = messageRepository.countByStatus("PENDING")
+                                    supersededCount = supersededTracker.countSuperseded()
+                                    pausedConversations = chatControl.getAllPaused()
+                                    exceptionConversations = chatControl.getAllExceptions()
+                                    message = "Status refreshed."
+                                }
+                            }
+                        ) { Text("Refresh Status") }
+                    }
+                }
+            }
+
+            Spacer(Modifier.height(20.dp))
             Text(
                 "Important: WhatsApp calls are not handled. Automatic answering applies only to standard carrier calls, and requires this app to be selected as the default phone app. Notification access must be enabled manually in Android settings.",
                 style = MaterialTheme.typography.bodySmall
@@ -291,4 +471,21 @@ private fun SettingSwitch(
         }
         Switch(checked = checked, onCheckedChange = onCheckedChange)
     }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@androidx.compose.runtime.Composable
+private fun CommandRow(command: String, description: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = androidx.compose.foundation.layout.Alignment.CenterVertically
+    ) {
+        Text(command, style = MaterialTheme.typography.bodyMedium.copy(fontFamily = androidx.compose.ui.text.FontFamily.Monospace))
+        Text(description, style = MaterialTheme.typography.bodySmall)
+    }
+    androidx.compose.foundation.layout.Divider(
+        modifier = Modifier.fillMaxWidth(),
+        color = MaterialTheme.colorScheme.outlineVariant
+    )
 }
