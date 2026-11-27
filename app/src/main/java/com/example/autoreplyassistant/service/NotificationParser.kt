@@ -14,8 +14,10 @@ object NotificationParser {
 
     private const val WHATSAPP = "com.whatsapp"
     private const val WHATSAPP_BUSINESS = "com.whatsapp.w4b"
+    private const val FACEBOOK_MESSENGER = "com.facebook.orca"
+    private const val FACEBOOK_MESSENGER_LITE = "com.facebook.lite"
 
-    val supportedPackages: Set<String> = setOf(WHATSAPP, WHATSAPP_BUSINESS)
+    val supportedPackages: Set<String> = setOf(WHATSAPP, WHATSAPP_BUSINESS, FACEBOOK_MESSENGER, FACEBOOK_MESSENGER_LITE)
 
     fun parse(
         sbn: StatusBarNotification,

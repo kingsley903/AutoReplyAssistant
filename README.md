@@ -1,7 +1,7 @@
 # Auto Reply Assistant (Android)
 
 A Kotlin + Jetpack Compose Android app for:
-- Auto-replying to WhatsApp and WhatsApp Business message notifications using notification `RemoteInput` reply actions.
+- Auto-replying to WhatsApp, WhatsApp Business, and Facebook Messenger message notifications using notification `RemoteInput` reply actions.
 - Auto-answering standard carrier phone calls through Android `InCallService`, only after the user selects this app as the default phone app.
 - Saving settings with Preferences DataStore.
 - Building a debug APK in GitHub Actions without Android Studio.
@@ -33,10 +33,10 @@ The workflow sets up JDK 17 and Gradle 8.7, generates the binary Gradle wrapper 
 
 The app does not detect, answer, or inject audio into WhatsApp calls.
 
-## WhatsApp behavior and limitations
+## WhatsApp and Messenger behavior and limitations
 
-- Only notifications from `com.whatsapp` and `com.whatsapp.w4b` are considered.
-- Notifications must expose a text body and a `RemoteInput` reply action. Some WhatsApp notification formats, muted chats, device/vendor variants or app versions may not expose a compatible action; those notifications cannot be replied to by this app.
+- Only notifications from `com.whatsapp`, `com.whatsapp.w4b`, `com.facebook.orca`, and `com.facebook.lite` are considered.
+- Notifications must expose a text body and a `RemoteInput` reply action. Some WhatsApp/Messenger notification formats, muted chats, device/vendor variants or app versions may not expose a compatible action; those notifications cannot be replied to by this app.
 - Android notification access is a sensitive special access that the user must explicitly grant in system settings.
 - A reply is generated through the configured OpenAI-compatible chat-completions endpoint. Keep the API key private.
 - Recent message context and duplicate/cooldown tracking are in-memory only and are cleared when Android kills the service or the app process restarts.
