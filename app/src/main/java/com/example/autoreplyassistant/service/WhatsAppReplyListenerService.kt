@@ -312,7 +312,7 @@ class WhatsAppReplyListenerService : NotificationListenerService() {
     private suspend fun getOwnerName(): String {
         return try {
             val repo = SettingsRepository(applicationContext)
-            repo.settings.first().ownerName
+            repo.settings.firstOrNull()?.ownerName ?: ""
         } catch (e: Exception) {
             ""
         }

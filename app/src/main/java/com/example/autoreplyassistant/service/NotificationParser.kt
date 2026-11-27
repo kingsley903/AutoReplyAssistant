@@ -168,7 +168,7 @@ object NotificationParser {
         )
         for (key in keys) {
             val value = extras.getCharSequence(key)?.toString()?.trim()
-            if (value.isNotBlank()) return value
+            if (!value.isNullOrBlank()) return value
         }
         val textLines = extras.getCharSequenceArray("android.textLines")
         if (textLines != null && textLines.size >= 2) {
@@ -190,7 +190,7 @@ object NotificationParser {
         )
         for (key in keys) {
             val value = extras.getCharSequence(key)?.toString()?.trim()
-            if (value.isNotBlank()) return value
+            if (!value.isNullOrBlank()) return value
         }
         return null
     }
