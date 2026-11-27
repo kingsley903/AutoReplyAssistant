@@ -10,4 +10,7 @@ data class PausedConversation(
     val conversationKey: String,
     val displayName: String,
     val pausedAt: Long
-)
+) {
+    val packageName: String
+        get() = conversationKey.substringBefore('|')
+}

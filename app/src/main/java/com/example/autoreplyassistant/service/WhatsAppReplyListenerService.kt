@@ -87,7 +87,7 @@ class WhatsAppReplyListenerService : NotificationListenerService() {
                     val trimmedText = parsed.messageText.trim()
                     val lowerText = trimmedText.lowercase()
                     if (COMMANDS.contains(lowerText)) {
-                        handleCommand(parsed, lowerText)
+                        handleCommand(parsed, lowerText, ownerName)
                         return@launch
                     }
                 }
@@ -103,6 +103,13 @@ class WhatsAppReplyListenerService : NotificationListenerService() {
                 }
 
                 when (parsed.direction) {
+                    MessageDirection.OUTGOING -> {
+                        ActivityLogStore.add(
+                            "SKIPPED",
+                            "Outgoing message in ${parsed.identity.displayName} — not replying"
+                        )
+                        return@launch
+                    }
                     MessageDirection.UNCERTAIN -> {
                         ActivityLogStore.add(
                             "SKIPPED",
@@ -182,7 +189,7 @@ class WhatsAppReplyListenerService : NotificationListenerService() {
      * Handles chat control commands sent by the account owner.
      * Command messages are never queued, never sent to OpenRouter, and never added to AI history.
      */
-    private fun handleCommand(parsed: ParsedNotification, command: String) {
+    private suspend fun handleCommand(parsed: ParsedNotification, command: String, ownerName: String) {
         val conversationKey = parsed.identity.conversationKey
         val displayName = parsed.identity.displayName
         val packageName = parsed.identity.packageName
@@ -222,7 +229,7 @@ class WhatsAppReplyListenerService : NotificationListenerService() {
             }
             "/.old" -> {
                 // Manual old-message response: respond to quoted message
-                handleOldCommand(parsed)
+                handleOldCommand(parsed, ownerName)
             }
             "/.r.this" -> {
                 // Reactivate current conversation (exception to global pause)
@@ -253,11 +260,11 @@ class WhatsAppReplyListenerService : NotificationListenerService() {
      * Handle /.old command — respond to a quoted/old message.
      * Extracts quoted message from notification metadata and queues it for AI response.
      */
-    private fun handleOldCommand(parsed: ParsedNotification) {
+    private fun handleOldCommand(parsed: ParsedNotification, ownerName: String) {
         val quotedText = parsed.quotedMessageText
         val quotedSender = parsed.quotedMessageSender
 
-        if (quotedText.isBlank()) {
+        if (quotedText.isNullOrBlank()) {
             ActivityLogStore.add(
                 "ERROR",
                 "/.old command: WhatsApp did not expose quoted message metadata. Cannot determine which message to respond to."
@@ -265,10 +272,9 @@ class WhatsAppReplyListenerService : NotificationListenerService() {
             return
         }
 
-        val targetSender = quotedSender.takeIf { it.isNotBlank() } ?: parsed.actualSender
+        val targetSender = quotedSender?.takeIf { it.isNotBlank() } ?: parsed.actualSender
 
         // Never respond to owner-authored messages
-        val ownerName = getOwnerNameSync()
         if (ownerName.isNotBlank() && targetSender.trim().lowercase() == ownerName.trim().lowercase()) {
             ActivityLogStore.add(
                 "SKIPPED",
@@ -300,15 +306,6 @@ class WhatsAppReplyListenerService : NotificationListenerService() {
                 "SKIPPED",
                 "/.old: duplicate manual request suppressed"
             )
-        }
-    }
-
-    private suspend fun getOwnerNameSync(): String {
-        return try {
-            val repo = SettingsRepository(applicationContext)
-            repo.settings.first().ownerName
-        } catch (e: Exception) {
-            ""
         }
     }
 

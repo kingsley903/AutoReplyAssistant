@@ -15,8 +15,9 @@ import com.example.autoreplyassistant.data.MessageDirection
 import com.example.autoreplyassistant.data.MessageQueueDatabase
 import com.example.autoreplyassistant.data.MessageQueueRepository
 import com.example.autoreplyassistant.data.QueuedMessage
-import com.example.autoreplyassistant.network.ReplyGenerator
 import com.example.autoreplyassistant.data.SettingsRepository
+import com.example.autoreplyassistant.data.SupersededMessageTracker
+import com.example.autoreplyassistant.network.ReplyGenerator
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -25,6 +26,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.roundToInt
 
 class QueueProcessor(
     private val context: Context,
@@ -36,6 +38,7 @@ class QueueProcessor(
     private val settingsRepository = SettingsRepository(context.applicationContext)
     private val chatControl = ChatControlRepository(dbHelper)
     private val historyRepository = ConversationHistoryRepository(dbHelper)
+    private val supersededTracker = SupersededMessageTracker(repository)
     private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     private val conversationLocks = ConcurrentHashMap<String, Any>()
@@ -55,7 +58,7 @@ class QueueProcessor(
         serviceScope.cancel()
     }
 
-    private fun processQueueLoop() {
+    private suspend fun processQueueLoop() {
         while (isRunning) {
             try {
                 processDueMessages()
@@ -66,7 +69,7 @@ class QueueProcessor(
         }
     }
 
-    private fun processDueMessages() {
+    private suspend fun processDueMessages() {
         val now = System.currentTimeMillis()
         val due = repository.getDueMessages(now)
         if (due.isEmpty()) return
@@ -74,24 +77,26 @@ class QueueProcessor(
         val byConversation = due.groupBy { it.conversationKey }
 
         for ((conversationKey, messages) in byConversation) {
-            val lock = conversationLocks.putIfAbsent(conversationKey, Any()) ?: conversationLocks[conversationKey]!!
-            synchronized(lock) {
-                if (!processingConversations.add(conversationKey)) {
-                    continue
-                }
-                try {
-                    for (message in messages) {
-                        if (!isRunning) break
-                        processSingleMessage(message)
+            if (!processingConversations.add(conversationKey)) {
+                continue
+            }
+            try {
+                val lock = conversationLocks.computeIfAbsent(conversationKey) { Any() }
+                // Execute message processing for this conversation
+                for (message in messages) {
+                    if (!isRunning) break
+                    synchronized(lock) {
+                        // synchronized block for any local state if needed
                     }
-                } finally {
-                    processingConversations.remove(conversationKey)
+                    processSingleMessage(message)
                 }
+            } finally {
+                processingConversations.remove(conversationKey)
             }
         }
     }
 
-    private fun processSingleMessage(message: QueuedMessage) {
+    private suspend fun processSingleMessage(message: QueuedMessage) {
         val id = message.id
 
         if (message.status != "PENDING" && message.status != "RETRY_WAIT") return
@@ -179,7 +184,7 @@ class QueueProcessor(
         }
     }
 
-    private fun deliverReply(message: QueuedMessage, replyText: String) {
+    private suspend fun deliverReply(message: QueuedMessage, replyText: String) {
         val notification = findLatestNotificationForConversation(message.packageName, message.conversationKey)
         val remoteInputAction = notification?.let { findRemoteInputAction(it) }
 

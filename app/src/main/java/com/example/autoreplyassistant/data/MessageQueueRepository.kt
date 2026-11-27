@@ -20,9 +20,8 @@ class MessageQueueRepository(val dbHelper: MessageQueueDatabase) {
                 put("status", message.status)
                 put("retry_count", message.retryCount)
                 put("next_retry_time_ms", message.nextRetryTimeMs)
-                put("last_error", message.lastError?.orEmpty())
+                put("last_error", message.lastError.orEmpty())
                 put("creation_timestamp_ms", message.creationTimestampMs)
-            }
                 put("superseded", if (message.superseded) 1 else 0)
                 put("quoted_message_ref", message.quotedMessageRef.orEmpty())
             }

@@ -104,11 +104,11 @@ class ChatControlRepository(private val dbHelper: MessageQueueDatabase) {
     fun formatPausedDuration(pausedAt: Long): String {
         val elapsed = System.currentTimeMillis() - pausedAt
         val minutes = TimeUnit.MILLISECONDS.toMinutes(elapsed)
-        return if (minutes < 1) "just now"
-        else if (minutes < 60) "${minutes} min${if (minutes != 1) "s" else ""} ago"
+        return if (minutes < 1L) "just now"
+        else if (minutes < 60L) "${minutes} min${if (minutes != 1L) "s" else ""} ago"
         else {
             val hours = TimeUnit.MILLISECONDS.toHours(elapsed)
-            "${hours} hour${if (hours != 1) "s" else ""} ago"
+            "${hours} hour${if (hours != 1L) "s" else ""} ago"
         }
     }
 

@@ -1,6 +1,7 @@
 package com.example.autoreplyassistant.service
 
 import android.app.Notification
+import android.os.Build
 import android.os.Bundle
 import android.service.notification.StatusBarNotification
 import com.example.autoreplyassistant.data.ConversationIdentity
@@ -37,7 +38,12 @@ object NotificationParser {
         val quotedText = extractQuotedText(extras)
         val quotedSender = extractQuotedSender(extras)
 
-        val messagingStyle = notification.getMessagingStyle() ?: return parseFallback(
+        val rawMessages = extras.getParcelableArray(Notification.EXTRA_MESSAGES)
+        val messages = if (rawMessages != null) {
+            Notification.MessagingStyle.Message.getMessagesFromBundleArray(rawMessages)
+        } else null
+
+        if (messages.isNullOrEmpty()) return parseFallback(
             packageName = packageName,
             title = title,
             body = body,
@@ -46,25 +52,20 @@ object NotificationParser {
             quotedSender = quotedSender
         )
 
-        val messages = messagingStyle.messages
-        if (messages.isEmpty()) return parseFallback(
-            packageName = packageName,
-            title = title,
-            body = body,
-            postTimeMs = postTimeMs,
-            quotedText = quotedText,
-            quotedSender = quotedSender
-        )
-
-        val conversationTitle = messagingStyle.conversationTitle?.let { it.trim() }.takeIf { it.isNotEmpty() }
+        val conversationTitleExtra = extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)
+            ?.toString()?.trim()?.takeIf { it.isNotEmpty() }
+        val conversationTitle = conversationTitleExtra
             ?: title.takeIf { it.isNotEmpty() }
             ?: "WhatsApp conversation"
 
         val distinctSenders = messages
-            .map { it.sender?.name?.trim() }
+            .map { extractSenderName(it) }
             .filter { it.isNotBlank() }
             .toSet()
-        val isGroup = distinctSenders.size > 1 || (messagingStyle.conversationTitle != null)
+        val isGroupExtra = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION, false)
+        } else false
+        val isGroup = isGroupExtra || distinctSenders.size > 1 || conversationTitleExtra != null
 
         val conversationKey = buildConversationKey(
             packageName = packageName,
@@ -81,9 +82,9 @@ object NotificationParser {
         )
 
         val latestMessage = messages.lastOrNull() ?: return null
-        val latestSender = latestMessage.sender?.name?.trim().orEmpty()
-        val latestText = latestMessage.text?.trim().orEmpty()
-        val latestTimestamp = latestMessage.timestamp?.let { it.toLong() } ?: postTimeMs
+        val latestSender = extractSenderName(latestMessage)
+        val latestText = latestMessage.text?.toString()?.trim().orEmpty()
+        val latestTimestamp = if (latestMessage.timestamp > 0L) latestMessage.timestamp else postTimeMs
 
         if (latestText.isBlank()) return null
 
@@ -194,14 +195,22 @@ object NotificationParser {
         return null
     }
 
+    private fun extractSenderName(message: Notification.MessagingStyle.Message): String {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            val personName = message.senderPerson?.name?.toString()?.trim()
+            if (!personName.isNullOrBlank()) return personName
+        }
+        return message.sender?.toString()?.trim().orEmpty()
+    }
+
     private fun buildConversationKey(
         packageName: String,
         conversationTitle: String?,
         infoText: String?,
         isGroup: Boolean
     ): String {
-        val stableId = if (isGroup && infoText.isNotBlank()) infoText else conversationTitle
-        return "$packageName|${stableId.takeIf { it.isNotEmpty() } ?: "unknown"}"
+        val stableId = if (isGroup && !infoText.isNullOrBlank()) infoText else conversationTitle
+        return "$packageName|${stableId?.takeIf { it.isNotEmpty() } ?: "unknown"}"
     }
 
     private fun buildMessageId(

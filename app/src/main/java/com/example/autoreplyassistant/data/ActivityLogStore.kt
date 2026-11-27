@@ -24,4 +24,9 @@ object ActivityLogStore {
         val item = ActivityLogItem(formatter.format(Date()), status, details.take(500))
         mutableItems.value = (listOf(item) + mutableItems.value).take(MAX_ITEMS)
     }
+
+    @Synchronized
+    fun clearLogs() {
+        mutableItems.value = emptyList()
+    }
 }
