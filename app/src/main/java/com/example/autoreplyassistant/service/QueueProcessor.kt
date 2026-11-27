@@ -99,9 +99,10 @@ class QueueProcessor(
     private suspend fun processSingleMessage(message: QueuedMessage) {
         val id = message.id
 
-        if (message.status != "PENDING" && message.status != "RETRY_WAIT") return
+        try {
+            if (message.status != "PENDING" && message.status != "RETRY_WAIT") return
 
-        val settings = settingsRepository.settings.firstOrNull() ?: return
+            val settings = settingsRepository.settings.firstOrNull() ?: return
 
         if (!settings.autoReplyEnabled) {
             repository.markSkipped(id, "Auto-reply disabled")
@@ -179,9 +180,20 @@ class QueueProcessor(
             val replyText = replyResult.second!!
             deliverReply(message, replyText)
         } else {
-            val error = replyResult.first!!
+            val error = replyResult.first ?: Exception("Unknown reply error")
             handleGenerationError(message, error)
         }
+    } catch (e: Throwable) {
+        ActivityLogStore.add("ERROR", "processSingleMessage crashed for ${message.id}: ${e.message ?: e.javaClass.simpleName}")
+        repository.updateStatus(
+            id = id,
+            status = "RETRY_WAIT",
+            retryCount = message.retryCount + 1,
+            nextRetryTimeMs = System.currentTimeMillis() + 30_000,
+            lastError = "Processor crash: ${e.message ?: e.javaClass.simpleName}"
+        )
+    }
+}
     }
 
     private suspend fun deliverReply(message: QueuedMessage, replyText: String) {
