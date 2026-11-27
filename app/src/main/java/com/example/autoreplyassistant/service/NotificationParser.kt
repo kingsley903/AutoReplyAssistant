@@ -4,10 +4,13 @@ import android.app.Notification
 import android.os.Build
 import android.os.Bundle
 import android.service.notification.StatusBarNotification
+import android.util.Log
 import com.example.autoreplyassistant.data.ConversationIdentity
 import com.example.autoreplyassistant.data.MessageDirection
 
 object NotificationParser {
+
+    private const val TAG = "NotificationParser"
 
     private const val WHATSAPP = "com.whatsapp"
     private const val WHATSAPP_BUSINESS = "com.whatsapp.w4b"
@@ -21,19 +24,28 @@ object NotificationParser {
         val packageName = sbn.packageName
         if (packageName !in supportedPackages) return null
 
-        val notification = sbn.notification ?: return null
+        val notification = sbn.notification ?: run {
+            Log.w(TAG, "parse: notification is null for ${sbn.packageName}")
+            return null
+        }
 
         val flags = notification.flags
         if ((flags and Notification.FLAG_GROUP_SUMMARY) != 0) return null
         if ((flags and Notification.FLAG_ONGOING_EVENT) != 0) return null
 
-        val extras = notification.extras ?: return null
+        val extras = notification.extras ?: run {
+            Log.w(TAG, "parse: extras is null for ${sbn.packageName}")
+            return null
+        }
         val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
         val body = extras.getCharSequence(Notification.EXTRA_TEXT)?.toString()?.trim().orEmpty()
         val infoText = extras.getCharSequence(Notification.EXTRA_INFO_TEXT)?.toString()?.trim()
         val postTimeMs = sbn.postTime
 
-        if (title.isBlank() && body.isBlank()) return null
+        if (title.isBlank() && body.isBlank()) {
+            Log.w(TAG, "parse: title and body both blank for ${sbn.packageName}")
+            return null
+        }
 
         val quotedText = extractQuotedText(extras)
         val quotedSender = extractQuotedSender(extras)
@@ -43,7 +55,9 @@ object NotificationParser {
             Notification.MessagingStyle.Message.getMessagesFromBundleArray(rawMessages)
         } else null
 
-        if (messages.isNullOrEmpty()) return parseFallback(
+        if (messages.isNullOrEmpty()) {
+            Log.w(TAG, "parse: no MessagingStyle messages, using fallback for ${sbn.packageName}")
+            return parseFallback(
             packageName = packageName,
             title = title,
             body = body,
@@ -86,7 +100,10 @@ object NotificationParser {
         val latestText = latestMessage.text?.toString()?.trim().orEmpty()
         val latestTimestamp = if (latestMessage.timestamp > 0L) latestMessage.timestamp else postTimeMs
 
-        if (latestText.isBlank()) return null
+        if (latestText.isBlank()) {
+            Log.w(TAG, "parse: latest text blank for ${sbn.packageName}")
+            return null
+        }
 
         val direction = determineDirection(
             latestSender = latestSender,

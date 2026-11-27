@@ -54,11 +54,19 @@ class WhatsAppReplyListenerService : NotificationListenerService() {
     }
 
     override fun onNotificationPosted(sbn: StatusBarNotification) {
-        if (sbn.packageName !in NotificationParser.supportedPackages) return
+        if (sbn.packageName !in NotificationParser.supportedPackages) {
+            ActivityLogStore.add("DEBUG", "Notification ignored: ${sbn.packageName} not supported")
+            return
+        }
+
+        ActivityLogStore.add("DEBUG", "Notification received: ${sbn.packageName} id=${sbn.id} postTime=${sbn.postTime}")
 
         serviceScope.launch {
             try {
                 val ownerName = getOwnerName()
+                if (ownerName.isBlank()) {
+                    ActivityLogStore.add("WARN", "Owner name not configured — all messages will be treated as UNCERTAIN and skipped")
+                }
                 val parsed = NotificationParser.parse(sbn, ownerName) ?: return@launch
 
                 ActivityLogStore.add(

@@ -101,7 +101,7 @@ class QueueProcessor(
 
         if (message.status != "PENDING" && message.status != "RETRY_WAIT") return
 
-        val settings = settingsRepository.settings.first()
+        val settings = settingsRepository.settings.firstOrNull() ?: return
 
         if (!settings.autoReplyEnabled) {
             repository.markSkipped(id, "Auto-reply disabled")
@@ -200,7 +200,7 @@ class QueueProcessor(
             return
         }
 
-        val currentSettings = settingsRepository.settings.first()
+        val currentSettings = settingsRepository.settings.firstOrNull() ?: return
         if (!currentSettings.autoReplyEnabled) {
             repository.markSkipped(message.id, "Auto-reply disabled before sending")
             ActivityLogStore.add("SKIPPED", "Auto-reply disabled before sending to ${message.actualSender}")
