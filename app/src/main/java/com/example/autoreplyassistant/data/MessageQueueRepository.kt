@@ -186,10 +186,10 @@ class MessageQueueRepository(val dbHelper: MessageQueueDatabase) {
                         status = cursor.getString(cursor.getColumnIndexOrThrow("status")),
                         retryCount = cursor.getInt(cursor.getColumnIndexOrThrow("retry_count")),
                         nextRetryTimeMs = cursor.getLong(cursor.getColumnIndexOrThrow("next_retry_time_ms")),
-                        lastError = cursor.getString(cursor.getColumnIndexOrThrow("last_error")).takeIf { it.isNotEmpty() },
+                        lastError = cursor.getString(cursor.getColumnIndexOrThrow("last_error"))?.takeIf { it.isNotEmpty() },
                         creationTimestampMs = cursor.getLong(cursor.getColumnIndexOrThrow("creation_timestamp_ms")),
                         superseded = cursor.getInt(cursor.getColumnIndexOrThrow("superseded")) == 1,
-                        quotedMessageRef = cursor.getString(cursor.getColumnIndexOrThrow("quoted_message_ref")).takeIf { it.isNotEmpty() }
+                        quotedMessageRef = cursor.getString(cursor.getColumnIndexOrThrow("quoted_message_ref"))?.takeIf { it.isNotEmpty() }
                     )
                 )
             }
