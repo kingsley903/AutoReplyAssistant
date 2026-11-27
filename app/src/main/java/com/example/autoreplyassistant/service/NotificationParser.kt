@@ -60,13 +60,14 @@ object NotificationParser {
         if (messages.isNullOrEmpty()) {
             Log.w(TAG, "parse: no MessagingStyle messages, using fallback for ${sbn.packageName}")
             return parseFallback(
-            packageName = packageName,
-            title = title,
-            body = body,
-            postTimeMs = postTimeMs,
-            quotedText = quotedText,
-            quotedSender = quotedSender
-        )
+                packageName = packageName,
+                title = title,
+                body = body,
+                postTimeMs = postTimeMs,
+                quotedText = quotedText,
+                quotedSender = quotedSender
+            )
+        }
 
         val conversationTitleExtra = extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)
             ?.toString()?.trim()?.takeIf { it.isNotEmpty() }
