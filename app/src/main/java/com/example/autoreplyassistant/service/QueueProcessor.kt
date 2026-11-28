@@ -194,10 +194,6 @@ class QueueProcessor(
             )
         }
     }
-        )
-    }
-}
-    }
 
     private suspend fun deliverReply(message: QueuedMessage, replyText: String) {
         val notification = findLatestNotificationForConversation(message.packageName, message.conversationKey)
